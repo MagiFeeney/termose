@@ -563,7 +563,7 @@ prefills it.  Opened from a terminal, that terminal is the target."
       (if (termose--terminal-p (current-buffer))
           (setq termose--target (current-buffer))
         ;; From a remote file, prefer a terminal on the same host.
-        (when-let ((same (and host (seq-find (lambda (b) (and (termose--terminal-p b)
+        (when-let* ((same (and host (seq-find (lambda (b) (and (termose--terminal-p b)
                                                               (equal (termose--host b) host)))
                                              (buffer-list)))))
           (unless (equal (and (termose--terminal-p termose--target) (termose--host termose--target)) host)
@@ -871,14 +871,17 @@ USED holds keys already taken."
 (transient-define-prefix termose-template-menu ()
   "Pick a template."
   [:description (lambda () (concat termose--group " templates"))
+   :class transient-column
    :setup-children termose--template-suffixes])
 
-(transient-define-prefix termose--menu ()
-  "termose menu."
+(transient-define-prefix termose-dispatch ()
+  "The termose menu: options, templates, notebook and send actions.
+Change its keys with `transient-suffix-put', e.g.
+  (transient-suffix-put 'termose-dispatch 'termose-send :key \"r\")"
   [:description (lambda ()
                   (concat "termose → " (termose--target-label)))
-   ["Options" :setup-children termose--option-suffixes]
-   ["Templates" :setup-children termose--group-suffixes]]
+   ["Options" :class transient-column :setup-children termose--option-suffixes]
+   ["Templates" :class transient-column :setup-children termose--group-suffixes]]
   [["Send"
     ("RET" "run" termose-send)
     ("C-j" "insert, don't run" termose-send-no-execute)]
@@ -896,7 +899,7 @@ USED holds keys already taken."
   (interactive)
   (unless (eq (current-buffer) (get-buffer termose--buffer))
     (call-interactively #'termose))
-  (transient-setup 'termose--menu))
+  (transient-setup 'termose-dispatch))
 
 (provide 'termose)
 ;;; termose.el ends here
