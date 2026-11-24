@@ -1,8 +1,12 @@
 ;;; termose.el --- Terminal Composer: A Compositional Command-line Interface -*- lexical-binding: t; -*-
 
-;; Version: 0.2.0
+;; Copyright (C) 2026  Magi Feeney
+
+;; Author: Magi Feeney <matrixfeeney@gmail.com>
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "28.1") (transient "0.4"))
 ;; Keywords: terminals, processes, convenience
+;; URL: https://github.com/MagiFeeney/termose
 
 ;; This file is not part of GNU Emacs.  License: GPL-3.0-or-later.
 
@@ -82,6 +86,11 @@ Each entry is (NAME EXPANSION . PROPERTIES).  See the file commentary."
      ("batch"  "sbatch --job-name={{name:job}} --gres=gpu:{{gpus:1}} --wrap='{{_}}'")
      ("queue"  "squeue -u $USER")
      ("cancel" "scancel {{jobid}}"))
+    ("loop"
+     ("files"  "for f in {{glob:*}}; do {{_}} \"$f\"; done")
+     ("range"  "for i in $(seq {{from:1}} {{to:10}}); do {{_}}; done")
+     ("values" "for v in {{values:1 2 3}}; do {{_}}; done")
+     ("lines"  "while IFS= read -r line; do {{_}}; done < {{file}}"))
     ("system"
      ("gpus"   "watch -n 1 nvidia-smi")
      ("disk"   "du -sh {{path:.}}/* | sort -h")
@@ -161,7 +170,7 @@ In a remote (TRAMP) directory, `termose-local-only-terminals' are skipped."
 (defun termose--word-end (s i)
   "End of the shell word starting at I in S."
   (let ((n (length s)) q)
-    (while (and (< i n) (or q (not (memq (aref s i) '(?\s ?\t ?\n)))))
+    (while (and (< i n) (or q (not (memq (aref s i) '(?\s ?\t ?\n ?\; ?| ?& ?\( ?\))))))
       (let ((c (aref s i)))
         (cond ((and (eq c ?\\) (not (eq q ?'))) (cl-incf i))
               ((eq c q) (setq q nil))
@@ -176,12 +185,12 @@ In a remote (TRAMP) directory, `termose-local-only-terminals' are skipped."
 (defun termose--token-at (s i)
   "If an option token starts at I in S, return (OPT . NAME-END)."
   (let ((p termose-prefix) (case-fold-search nil))
-    (when (and (or (= i 0) (memq (aref s (1- i)) '(?\s ?\t ?\n)))
+    (when (and (or (= i 0) (memq (aref s (1- i)) '(?\s ?\t ?\n ?\; ?| ?& ?\()))
                (string-prefix-p p (substring s i))
                (eq (string-match "[[:alpha:]_][[:alnum:]_-]*" s (+ i (length p)))
                    (+ i (length p))))
       (let ((opt (termose--opt (match-string 0 s))) (e (match-end 0)))
-        (when (and opt (or (= e (length s)) (memq (aref s e) '(?\s ?\t ?\n ?=))))
+        (when (and opt (or (= e (length s)) (memq (aref s e) '(?\s ?\t ?\n ?= ?\; ?| ?& ?\)))))
           (cons opt e))))))
 
 (defun termose--args (s j opt ask)
@@ -198,7 +207,8 @@ In a remote (TRAMP) directory, `termose-local-only-terminals' are skipped."
              (e (termose--word-end s p))
              (w (substring s p e)))
         (if (and (> e p) (not (termose--token-at s p))
-                 (or (null re) (string-match-p (concat "\\`\\(?:" re "\\)\\'") w)))
+                 (or (null re) (string-prefix-p "$" w)
+                     (string-match-p (concat "\\`\\(?:" re "\\)\\'") w)))
             (progn (push w args) (setq j e))
           (push (or (nth k defs)
                     (if ask (read-string (format "%s%s arg %d: " termose-prefix (car opt) (1+ k)))
@@ -232,32 +242,250 @@ In a remote (TRAMP) directory, `termose-local-only-terminals' are skipped."
         ((string-match-p "\\`[A-Za-z_][A-Za-z0-9_]*=" text) 'front)
         (t 'here)))
 
+;;;; Scoping: which command an option belongs to
+
+(defun termose--match-close (s i)
+  "Index after the bracket matching the one at I in S (quote-aware)."
+  (let* ((open (aref s i)) (close (if (eq open ?\() ?\) ?})) (depth 0) (n (length s)) q)
+    (catch 'done
+      (while (< i n)
+        (let ((c (aref s i)))
+          (cond (q (cond ((and (eq c ?\\) (not (eq q ?'))) (cl-incf i))
+                         ((eq c q) (setq q nil))))
+                ((eq c ?\\) (cl-incf i))
+                ((memq c '(?' ?\" ?`)) (setq q c))
+                ((eq c open) (cl-incf depth))
+                ((eq c close) (when (= (cl-decf depth) 0) (throw 'done (1+ i))))))
+        (cl-incf i))
+      n)))
+
+(defun termose--lex-word-end (s i)
+  "End of the shell word at I in S: quotes, $(..), ${..} and redirects stay whole."
+  (let ((n (length s)) q done)
+    (while (and (< i n) (not done))
+      (let ((c (aref s i))
+            (prev (and (> i 0) (aref s (1- i))))
+            (next (and (< (1+ i) n) (aref s (1+ i)))))
+        (cond
+         (q (cond ((and (eq c ?\\) (not (eq q ?'))) (cl-incf i 2))
+                  ((eq c q) (setq q nil) (cl-incf i))
+                  (t (cl-incf i))))
+         ((eq c ?\\) (cl-incf i 2))
+         ((memq c '(?' ?\" ?`)) (setq q c) (cl-incf i))
+         ((and (memq c '(?$ ?< ?>)) (eq next ?\()) (setq i (termose--match-close s (1+ i))))
+         ((and (eq c ?$) (eq next ?{)) (setq i (termose--match-close s (1+ i))))
+         ((memq c '(?\s ?\t ?\n ?\; ?\( ?\))) (setq done t))
+         ((eq c ?&) (if (or (memq prev '(?< ?>)) (eq next ?>)) (cl-incf i) (setq done t)))
+         ((eq c ?|) (if (eq prev ?>) (cl-incf i) (setq done t)))
+         (t (cl-incf i)))))
+    (min i n)))
+
+(defun termose--lex (s toks)
+  "Split S into items (TYPE TEXT BEG END).  TYPE is word, op or opt.
+TOKS are option tokens; one starting an item becomes an opt item."
+  (let ((i 0) (n (length s)) items)
+    (while (< i n)
+      (let ((c (aref s i))
+            (next (and (< (1+ i) n) (aref s (1+ i)))))
+        (while (and toks (< (nth 1 (car toks)) i)) (pop toks))
+        (cond
+         ((and toks (= i (nth 1 (car toks))))
+          (let ((tk (pop toks)))
+            (push (list 'opt tk i (nth 2 tk)) items)
+            (setq i (nth 2 tk))))
+         ((memq c '(?\s ?\t)) (cl-incf i))
+         ((and (eq c ?\\) (eq next ?\n)) (cl-incf i 2))
+         ((eq c ?#) (while (and (< i n) (not (eq (aref s i) ?\n))) (cl-incf i)))
+         ((eq c ?\n) (push (list 'op "\n" i (1+ i)) items) (cl-incf i))
+         ((and (eq c ?&) (eq next ?>))
+          (let ((e (termose--lex-word-end s i))) (push (list 'word (substring s i e) i e) items) (setq i e)))
+         ((memq c '(?\; ?& ?| ?\( ?\)))
+          (let* ((len (if (or (and (eq c ?\;) (eq next ?\;)) (and (eq c ?&) (eq next ?&))
+                              (and (eq c ?|) (memq next '(?| ?&))))
+                          2 1))
+                 (op (substring s i (+ i len))))
+            (push (list 'op (pcase op (";;" ";") ("|&" "|") (_ op)) i (+ i len)) items)
+            (cl-incf i len)))
+         (t (let ((e (max (1+ i) (termose--lex-word-end s i))))
+              (push (list 'word (substring s i e) i e) items)
+              (setq i e))))))
+    (nreverse items)))
+
+(cl-defstruct (termose--cmd (:constructor termose--cmd-make) (:copier nil))
+  beg end env front compound chain)
+(cl-defstruct (termose--chain (:constructor termose--chain-make) (:copier nil))
+  beg end suffix wraps)
+
+(defconst termose--closers
+  '(("done" "for" "select" "while" "until") ("fi" "if") ("esac" "case") ("}" "{") (")" "(")))
+
+(defun termose--env-p (text) (string-match-p "\\`[A-Za-z_][A-Za-z0-9_]*=" text))
+
+(defun termose--parse (s toks)
+  "Find the commands and chains of S and attach option tokens TOKS to them.
+TOKS are (OPT BEG END ARGS TEXT PLACE).  Return (CMDS . CHAINS)."
+  (let (cmds chains chain cmd (at-cmd t) header pending stack last-cmd seen)
+    (cl-labels
+        ((touch (end) (when chain (setf (termose--chain-end chain)
+                                        (max end (termose--chain-end chain)))))
+         (new-chain (beg) (unless chain
+                            (setq chain (termose--chain-make :beg beg :end beg))
+                            (push chain chains)))
+         (attach (tk c)
+           (let ((ch (termose--cmd-chain c)) (text (nth 4 tk)))
+             (pcase (nth 5 tk)
+               ('front (if (termose--env-p text)
+                           (setf (termose--cmd-env c) (append (termose--cmd-env c) (list text)))
+                         (setf (termose--cmd-front c) (append (termose--cmd-front c) (list text)))))
+               ('end (setf (termose--chain-suffix ch) (append (termose--chain-suffix ch) (list text))))
+               ('wrap (setf (termose--chain-wraps ch) (append (termose--chain-wraps ch) (list text)))))))
+         (start-cmd (beg end compound)
+           (new-chain beg)
+           (setq cmd (termose--cmd-make :beg beg :end end :compound compound :chain chain)
+                 at-cmd nil last-cmd cmd)
+           (push cmd cmds)
+           (touch end)
+           (dolist (tk (nreverse pending)) (attach tk cmd))
+           (setq pending nil))
+         (close-chain () (setq chain nil cmd nil at-cmd t))
+         (open (kw beg end)
+           (start-cmd beg end t)
+           (push (list kw cmd chain) stack)
+           (setq chain nil cmd nil at-cmd t
+                 header (cond ((member kw '("for" "select")) 'for)
+                              ((equal kw "case") 1))))
+         (close (closer end)
+           (let ((frame (car stack)))
+             (when (and frame (member (car frame) (cdr (assoc closer termose--closers))))
+               (pop stack)
+               (setq cmd (nth 1 frame) chain (nth 2 frame) at-cmd nil header nil)
+               (setf (termose--cmd-end cmd) end)
+               (touch end)
+               t))))
+      (pcase-dolist (`(,type ,x ,beg ,end) (termose--lex s toks))
+        (cond
+         ((eq type 'opt)
+          (push x seen)
+          (unless (eq (nth 5 x) 'here)
+            (cond ((integerp header) (attach x (nth 1 (car stack))))
+                  ((or header at-cmd (null cmd)) (unless header (new-chain beg)) (push x pending))
+                  (t (attach x cmd))))
+          (touch end))
+         ((integerp header)             ; inside case … esac: opaque
+          (cond ((equal x "case") (cl-incf header))
+                ((and (equal x "esac") (= (cl-decf header) 0)) (close "esac" end))))
+         ((eq header 'for)
+          (when (equal x "do") (setq header nil at-cmd t)))
+         ((eq type 'op)
+          (cond ((member x '(";" "&" "\n")) (close-chain))
+                ((member x '("&&" "||" "|")) (touch end) (setq cmd nil at-cmd t))
+                ((equal x "(") (if at-cmd (open "(" beg end) (touch end)))
+                ((equal x ")") (unless (close ")" end) (touch end)))))
+         (at-cmd
+          (cond ((member x '("for" "select" "while" "until" "if" "case" "{")) (open x beg end))
+                ((member x '("do" "then" "else" "elif" "!")) (close-chain))
+                ((member x '("done" "fi" "esac" "}")) (close x end))
+                (t (start-cmd beg end nil))))
+         (cmd (setf (termose--cmd-end cmd) end) (touch end))))
+      ;; Unclosed blocks (still typing): close them at the end of the text.
+      (while stack
+        (let ((frame (pop stack)))
+          (setq cmd (nth 1 frame) chain (nth 2 frame))
+          (setf (termose--cmd-end cmd) (length s))
+          (touch (length s))))
+      ;; Options with no command after them go to the last command;
+      ;; options hidden inside a word, e.g. $(… \gpu …), to the command around them.
+      (when last-cmd (dolist (tk (nreverse pending)) (attach tk last-cmd)))
+      (dolist (tk toks)
+        (unless (or (memq tk seen) (eq (nth 5 tk) 'here))
+          (let ((c (or (car (sort (seq-filter (lambda (c) (<= (termose--cmd-beg c) (nth 1 tk)
+                                                              (termose--cmd-end c)))
+                                              cmds)
+                                  (lambda (a b) (< (- (termose--cmd-end a) (termose--cmd-beg a))
+                                                   (- (termose--cmd-end b) (termose--cmd-beg b))))))
+                       last-cmd)))
+            (when c (attach tk c)))))
+      (cons cmds chains))))
+
+(defun termose--quote (s)
+  (concat "'" (replace-regexp-in-string "'" "'\\''" s t t) "'"))
+
+(defun termose--cmd-fn (c)
+  (let ((env (termose--cmd-env c)) (front (termose--cmd-front c)))
+    (if (termose--cmd-compound c)
+        (lambda (inner)
+          (let ((x (string-trim inner)))
+            (when front (setq x (concat (string-join front " ") " bash -c " (termose--quote x))))
+            (when env (setq x (format "(export %s; %s)" (string-join env " ") x)))
+            x))
+      (lambda (inner) (string-join (append env front (list (string-trim inner))) " ")))))
+
+(defun termose--chain-fn (ch)
+  (let ((suffix (termose--chain-suffix ch)) (wraps (termose--chain-wraps ch)))
+    (lambda (inner)
+      (let ((x (string-trim inner)))
+        (dolist (sfx suffix) (setq x (concat x " " sfx)))
+        (dolist (w wraps x)
+          (setq x (replace-regexp-in-string
+                   "{qcmd}" (termose--quote x)
+                   (replace-regexp-in-string "{cmd}" x w t t) t t)))))))
+
+(defun termose--render-regions (s beg end regions)
+  "Render S from BEG to END, replacing REGIONS (BEG END FN-OR-STRING RANK)."
+  (let ((pos beg) (out ""))
+    (while regions
+      (let* ((r (pop regions)) (rb (nth 0 r)) (re (nth 1 r)) (f (nth 2 r)) children)
+        (while (and regions (< (nth 0 (car regions)) re))
+          (push (pop regions) children))
+        (setq out (concat out (substring s pos rb)))
+        (let* ((inner (termose--render-regions s rb re (nreverse children)))
+               (text (if (functionp f) (funcall f inner) f)))
+          (setq out (concat out text))
+          (setq pos re)
+          ;; A removed option leaves no double space behind.
+          (when (and (equal f "") (or (string-empty-p out) (memq (aref out (1- (length out))) '(?\s ?\t))))
+            (setq pos (min end (termose--skip-blanks s pos)))
+            (when (or (= pos end) (memq (aref s pos) '(?\; ?\) ?\n)))
+              (setq out (string-trim-right out))))
+          ;; "cmd &" already ends the command: drop a following ";" (bash rejects "&;").
+          (when (and (functionp f) (string-match-p "[^&]&\\'" text))
+            (let ((q (min end (termose--skip-blanks s pos))))
+              (when (and (< q end) (eq (aref s q) ?\;)
+                         (not (and (< (1+ q) end) (eq (aref s (1+ q)) ?\;))))
+                (setq pos (1+ q))))))))
+    (concat out (substring s pos end))))
+
 (defun termose-expand (string &optional ask)
   "Return STRING with its option tokens expanded.
+Prefixes go in front of the command they are written in; suffixes and
+wrappers apply to the `a && b | c' chain they are in; after done/fi/}
+an option applies to the whole loop or block.
 With ASK, prompt for missing arguments that have no default."
-  (let ((pos 0) out env front end wraps)
-    (pcase-dolist (`(,opt ,beg ,stop ,args) (termose--scan string ask))
-      (push (substring string pos beg) out)
-      (let* ((text (termose--render opt args)))
-        (pcase (termose--place opt text)
-          ('here (push text out))
-          ('wrap (push text wraps))
-          ('end (push text end))
-          ('front (if (string-match-p "\\`[A-Za-z_][A-Za-z0-9_]*=" text)
-                      (push text env)
-                    (push text front))))
-        (setq pos (if (eq (termose--place opt text) 'here) stop
-                    (termose--skip-blanks string stop)))))
-    (push (substring string pos) out)
-    (let ((cmd (string-join
-                (delete "" (append (reverse env) (reverse front)
-                                   (list (string-trim (apply #'concat (reverse out))))
-                                   (reverse end)))
-                " ")))
-      (dolist (w (reverse wraps) cmd)
-        (setq cmd (replace-regexp-in-string
-                   "{qcmd}" (concat "'" (replace-regexp-in-string "'" "'\\''" cmd t t) "'")
-                   (replace-regexp-in-string "{cmd}" cmd w t t) t t))))))
+  (let* ((toks (mapcar (lambda (tk)
+                         (let ((text (termose--render (car tk) (nth 3 tk))))
+                           (append tk (list text (termose--place (car tk) text)))))
+                       (termose--scan string ask)))
+         (parsed (termose--parse string toks))
+         (regions
+          (append
+           (mapcar (lambda (tk) (list (nth 1 tk) (nth 2 tk)
+                                      (if (eq (nth 5 tk) 'here) (nth 4 tk) "") 2))
+                   toks)
+           (cl-loop for c in (car parsed)
+                    when (or (termose--cmd-env c) (termose--cmd-front c))
+                    collect (list (termose--cmd-beg c) (termose--cmd-end c) (termose--cmd-fn c) 1))
+           (cl-loop for ch in (cdr parsed)
+                    when (or (termose--chain-suffix ch) (termose--chain-wraps ch))
+                    collect (list (termose--chain-beg ch) (termose--chain-end ch)
+                                  (termose--chain-fn ch) 0)))))
+    (setq regions (sort regions (lambda (a b)
+                                  (cond ((/= (nth 0 a) (nth 0 b)) (< (nth 0 a) (nth 0 b)))
+                                        ((/= (nth 1 a) (nth 1 b)) (> (nth 1 a) (nth 1 b)))
+                                        (t (< (nth 3 a) (nth 3 b)))))))
+    (if (and toks (null (car parsed)))
+        ;; Only options, no command yet.
+        (string-join (mapcar (lambda (tk) (nth 4 tk)) toks) " ")
+      (string-trim (termose--render-regions string 0 (length string) regions)))))
 
 ;;;; Templates
 
@@ -286,14 +514,22 @@ With ASK, prompt for missing arguments that have no default."
     (cons (concat out (substring template pos)) cursor)))
 
 (defun termose-insert-template (template)
-  "Fill TEMPLATE and insert it in the composer."
+  "Fill TEMPLATE and insert it at point in the composer."
   (with-current-buffer (termose--composer)
     (let ((filled (termose-fill template)))
-      (goto-char (point-max))
+      ;; Insert at point, so templates nest: a loop first, then a command in it.
       (unless (or (bobp) (memq (char-before) '(?\s ?\t ?\n))) (insert " "))
-      (let ((start (point)))
-        (insert (car filled))
-        (when (cdr filled) (goto-char (+ start (cdr filled))))
+      (let* ((start (point))
+             (_ (insert (car filled)))
+             (cursor (copy-marker (if (cdr filled) (+ start (cdr filled)) (point)))))
+        (cond ((and (memq (char-before) '(?\s ?\t)) (memq (char-after) '(?\s ?\t)))
+               (delete-char 1))
+              ((and (memq (char-before) '(?\s ?\t)) (memq (char-after) '(?\; ?\))))
+               (delete-char -1)))
+        (unless (or (eobp) (memq (char-after) '(?\s ?\t ?\n ?\; ?\" ?\')))
+          (insert " ") (backward-char))
+        (goto-char cursor)
+        (set-marker cursor nil)
         (dolist (w (get-buffer-window-list (current-buffer)))
           (set-window-point w (point)))))))
 
@@ -788,27 +1024,63 @@ USED holds keys already taken."
 (defun termose--tokens ()
   (with-current-buffer (termose--composer) (termose--scan (buffer-string))))
 
+(defun termose--scope-at (s p)
+  "Return (CMD-BEG . CHAIN-END) for the command at index P of S, or nil.
+Blanks right before or after a command count as that command."
+  (let* ((cmds (car (termose--parse s nil)))
+         (p2 (min (length s) (termose--skip-blanks s p)))
+         (size (lambda (c) (- (termose--cmd-end c) (termose--cmd-beg c))))
+         (around (lambda (q) (sort (seq-filter (lambda (c) (<= (termose--cmd-beg c) q (termose--cmd-end c)))
+                                               cmds)
+                                   (lambda (a b) (< (funcall size a) (funcall size b))))))
+         (pb (let ((q p)) (while (and (> q 0) (memq (aref s (1- q)) '(?\s ?\t))) (cl-decf q)) q))
+         (smallest (lambda (cs) (car (sort cs (lambda (a b) (< (funcall size a) (funcall size b)))))))
+         (c (or (funcall smallest (seq-filter (lambda (c) (= (termose--cmd-beg c) p2)) cmds)) ; before one
+                (funcall smallest (seq-filter (lambda (c) (= (termose--cmd-end c) pb)) cmds)) ; after one
+                (car (funcall around p))
+                (car (sort (seq-filter (lambda (c) (<= (termose--cmd-beg c) p)) cmds)
+                           (lambda (a b) (> (termose--cmd-beg a) (termose--cmd-beg b))))))))
+    (when c (cons (termose--cmd-beg c) (termose--chain-end (termose--cmd-chain c))))))
+
+(defun termose--nearest-token (opt p)
+  "OPT's token in the composer closest to index P, or nil."
+  (car (sort (seq-filter (lambda (tk) (eq (car tk) opt)) (termose--tokens))
+             (lambda (a b) (< (min (abs (- (nth 1 a) p)) (abs (- (nth 2 a) p)))
+                              (min (abs (- (nth 1 b) p)) (abs (- (nth 2 b) p))))))))
+
 (defun termose-toggle (name)
-  "Add option NAME to the composer text, or remove it if present."
+  "Add option NAME to the command at point, or remove the nearest one.
+Prefixes go in front of that command, suffixes and wrappers after its
+chain; with point after done/fi/}, the whole loop or block."
   (with-current-buffer (termose--composer)
     (let* ((opt (termose--opt name))
-           (tok (seq-find (lambda (tk) (eq (car tk) opt)) (termose--tokens))))
+           (p (1- (point)))
+           (tok (termose--nearest-token opt p)))
       (if tok
           (let ((beg (1+ (nth 1 tok))) (end (1+ (nth 2 tok))))
             (delete-region beg (save-excursion (goto-char end) (skip-chars-forward " \t") (point)))
             (goto-char beg)
-            (when (and (eolp) (memq (char-before) '(?\s ?\t))) (delete-char -1)))
+            (when (and (or (eolp) (memq (char-after) '(?\; ?\)))) (memq (char-before) '(?\s ?\t)))
+              (delete-char -1)))
         (let* ((defs (termose--defaults opt))
                (args (cl-loop for k below (termose--nargs opt)
                               collect (read-string (format "%s%s arg %d: " termose-prefix name (1+ k))
                                                    nil nil (nth k defs))))
                (token (string-join (cons (concat termose-prefix name) args) " "))
-               (text (termose--render opt args)))
-          (if (eq (termose--place opt text) 'front)
-              (progn (goto-char (point-min)) (insert token " "))
-            (goto-char (point-max))
+               (text (termose--render opt args))
+               (place (termose--place opt text))
+               (scope (termose--scope-at (buffer-string) p)))
+          (cond
+           ((eq place 'here)
             (unless (or (bobp) (memq (char-before) '(?\s ?\t ?\n))) (insert " "))
-            (insert token)))))))
+            (insert token " "))
+           ((eq place 'front)
+            (goto-char (if scope (1+ (car scope)) (point-min)))
+            (insert token " "))
+           (t
+            (goto-char (if scope (1+ (cdr scope)) (point-max)))
+            (unless (or (bobp) (memq (char-before) '(?\s ?\t ?\n))) (insert " "))
+            (insert token))))))))
 
 (defun termose--option-suffixes (_)
   (transient-parse-suffixes
@@ -826,7 +1098,7 @@ USED holds keys already taken."
 
 (defun termose--option-desc (name)
   (let* ((opt (termose--opt name))
-         (tok (seq-find (lambda (tk) (eq (car tk) opt)) (termose--tokens))))
+         (tok (termose--nearest-token opt (with-current-buffer (termose--composer) (1- (point))))))
     (concat (propertize (concat termose-prefix name) 'face (if tok 'transient-value 'transient-heading))
             (propertize " " 'display '(space :align-to 18))
             (if tok
